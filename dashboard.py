@@ -365,7 +365,7 @@ def main():
 
         # Sélection par ID ou par index
         if "SK_ID_CURR" in df.columns:
-            id_list = sorted(df["SK_ID_CURR"].unique().tolist())
+            id_list = sorted(df["SK_ID_CURR"].dropna().astype(int).unique().tolist())
             client_id = st.selectbox(
                 "Identifiant client (SK_ID_CURR)",
                 options=id_list,
