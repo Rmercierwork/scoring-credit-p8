@@ -26,6 +26,11 @@ API_URL = "https://rmercierwork-scoring-credit-p7.hf.space"
 DATA_PATH = "data/application_train_prepared.csv"
 MODEL_PATH = "models/lgbm_final.pkl"
 SEUIL_PATH = "models/seuil_optimal.pkl"
+SCALER_PATH = "models/scaler.pkl"   # StandardScaler du preprocessing P7 (variables continues)
+
+# Variables financières que le chargé de clientèle peut faire varier en simulation.
+# Ce sont des leviers "actionnables" (contrairement à l'âge ou aux EXT_SOURCE).
+SIM_CANDIDATES = ["AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY"]
 
 # ── Accessibilité WCAG – palette accessible daltonisme ───────
 COLORS = {
@@ -90,11 +95,62 @@ def load_model(model_path: str, seuil_path: str):
     return model, seuil
 
 
+@st.cache_resource(show_spinner="Chargement du scaler…")
+def load_scaler(scaler_path: str):
+    """Charge le StandardScaler du preprocessing.
+    Retourne None si absent : le dashboard reste fonctionnel mais affiche
+    les valeurs standardisées et désactive la simulation en euros.
+    """
+    if not os.path.exists(scaler_path):
+        return None
+    return joblib.load(scaler_path)
+
+
 @st.cache_resource(show_spinner="Calcul des SHAP (patience…)")
 def build_explainer(_model, X_sample: pd.DataFrame):
     """Explainer SHAP TreeExplainer sur un échantillon."""
     explainer = shap.TreeExplainer(_model)
     return explainer
+
+
+# ── Conversion euros ↔ z-score via le scaler ─────────────────
+class Rescaler:
+    """Aller-retour entre valeurs réelles (€, jours…) et valeurs standardisées.
+
+    Le scaler a été entraîné sur un sous-ensemble de variables continues :
+    seules celles présentes dans `feature_names_in_` sont convertibles.
+    Les variables binaires (ex : CODE_GENDER_F) ne sont pas standardisées et
+    sont donc renvoyées telles quelles.
+    """
+    def __init__(self, scaler):
+        self.scaler = scaler
+        self.index = {}
+        if scaler is not None and hasattr(scaler, "feature_names_in_"):
+            self.index = {name: i for i, name in enumerate(scaler.feature_names_in_)}
+
+    def is_scalable(self, feature: str) -> bool:
+        return feature in self.index
+
+    def to_real(self, feature: str, z):
+        """z-score → valeur réelle."""
+        if not self.is_scalable(feature):
+            return z
+        i = self.index[feature]
+        return z * self.scaler.scale_[i] + self.scaler.mean_[i]
+
+    def to_scaled(self, feature: str, real):
+        """valeur réelle → z-score."""
+        if not self.is_scalable(feature):
+            return real
+        i = self.index[feature]
+        return (real - self.scaler.mean_[i]) / self.scaler.scale_[i]
+
+    def real_series(self, df: pd.DataFrame, feature: str) -> pd.Series:
+        """Colonne entière ramenée en valeurs réelles (pour bornes de sliders)."""
+        if not self.is_scalable(feature):
+            return df[feature]
+        i = self.index[feature]
+        return df[feature] * self.scaler.scale_[i] + self.scaler.mean_[i]
 
 
 # ── Appel API ────────────────────────────────────────────────
@@ -113,8 +169,49 @@ def call_api(features: dict) -> dict | None:
         return None
 
 
+def proba_with_overrides(base_features: dict, overrides_scaled: dict) -> float | None:
+    """Renvoie la probabilité de défaut en remplaçant certaines features
+    (valeurs déjà standardisées) puis en appelant l'API. Utilisé par la
+    simulation et la recherche du seuil de bascule."""
+    d = dict(base_features)
+    d.update(overrides_scaled)
+    res = call_api(d)
+    return None if res is None else res["probabilite_defaut"]
+
+
+def bisect_tipping(pf, lo: float, hi: float, seuil: float,
+                   proba_decreasing: bool, n_iter: int = 15):
+    """Recherche par dichotomie de la valeur (en €) qui fait basculer la décision.
+
+    pf(x) -> probabilité de défaut pour la valeur réelle x (ou None si erreur API).
+    proba_decreasing=True  : augmenter x diminue la proba (ex : revenu).
+    proba_decreasing=False : augmenter x augmente la proba (ex : montant du crédit).
+    Renvoie la valeur seuil x* (frontière ACCORDÉ / REFUSÉ).
+    """
+    for _ in range(n_iter):
+        mid = (lo + hi) / 2
+        p = pf(mid)
+        if p is None:
+            return None
+        passes = p < seuil
+        if proba_decreasing:
+            # x élevé → proba faible : si ça passe à mid, on peut descendre x
+            if passes:
+                hi = mid
+            else:
+                lo = mid
+        else:
+            # x élevé → proba forte : si ça passe à mid, on peut monter x
+            if passes:
+                lo = mid
+            else:
+                hi = mid
+    return hi if proba_decreasing else lo
+
+
 # ── Graphique jauge ──────────────────────────────────────────
-def make_gauge(proba: float, seuil: float, decision: str) -> go.Figure:
+def make_gauge(proba: float, seuil: float, decision: str,
+               title: str = "Probabilité de défaut") -> go.Figure:
     """Jauge de probabilité de défaut.
     WCAG 1.4.1 : la couleur n'est pas le seul indicateur (texte présent).
     WCAG 1.4.3 : contraste suffisant sur fond blanc.
@@ -155,7 +252,7 @@ def make_gauge(proba: float, seuil: float, decision: str) -> go.Figure:
             },
         },
         title={
-            "text": "Probabilité de défaut<br><span style='font-size:0.8em;color:#757575'>"
+            "text": f"{title}<br><span style='font-size:0.8em;color:#757575'>"
                     f"Seuil de décision : {round(seuil*100,1)} %</span>",
             "font": {"size": 16},
         },
@@ -323,6 +420,21 @@ def make_bivariate(df: pd.DataFrame,
     return fig
 
 
+# ── Mise en forme d'une valeur réelle pour affichage ─────────
+def format_real(feature: str, real_val) -> str:
+    """Affiche une valeur réelle avec l'unité adaptée."""
+    if pd.isna(real_val):
+        return "N/A"
+    if feature == "DAYS_BIRTH":
+        return f"{int(abs(real_val) / 365)} ans"
+    if feature in ("DAYS_EMPLOYED", "DAYS_REGISTRATION", "DAYS_ID_PUBLISH",
+                   "DAYS_LAST_PHONE_CHANGE"):
+        return f"{abs(real_val) / 365:.1f} ans"
+    if feature.startswith("AMT_") or "CREDIT" in feature or "INCOME" in feature:
+        return f"{real_val:,.0f} €".replace(",", " ")
+    return f"{real_val:.3f}"
+
+
 # ══════════════════════════════════════════════════════════════
 # ── Application principale ───────────────────────────────────
 # ══════════════════════════════════════════════════════════════
@@ -353,6 +465,8 @@ def main():
 
     df    = load_data(DATA_PATH)
     model, seuil = load_model(MODEL_PATH, SEUIL_PATH)
+    scaler = load_scaler(SCALER_PATH)
+    rescaler = Rescaler(scaler)
 
     # Colonnes features (tout sauf TARGET si présente)
     feature_cols = [c for c in df.columns if c not in ("TARGET", "SK_ID_CURR")]
@@ -387,6 +501,12 @@ def main():
         )
 
         st.divider()
+        if scaler is None:
+            st.warning(
+                "Scaler non trouvé (`models/scaler.pkl`) : les valeurs sont "
+                "affichées standardisées et la simulation en euros est désactivée.",
+                icon="⚠️",
+            )
         st.caption(
             "ℹ️ Ce dashboard est un outil d'aide à la décision. "
             "La décision finale reste sous la responsabilité du chargé de relation client."
@@ -410,6 +530,28 @@ def main():
     proba    = result["probabilite_defaut"]
     seuil_v  = result["seuil"]
     decision = result["decision"]
+
+    # ══════════════════════════════════════════════════════════
+    # ── CARTES DE SYNTHÈSE (en-tête) ─────────────────────────
+    # ══════════════════════════════════════════════════════════
+    # Coup d'œil rapide : décision, proba, seuil, marge, et deux
+    # repères client en unités réelles si le scaler est disponible.
+    ecart_pts = (proba - seuil_v) * 100
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Décision", f"{'✅' if decision == 'ACCORDÉ' else '❌'} {decision}")
+    k2.metric("Probabilité de défaut", f"{proba*100:.1f} %")
+    k3.metric("Seuil de décision", f"{seuil_v*100:.1f} %")
+    k4.metric("Marge au seuil", f"{ecart_pts:+.1f} pts",
+              help="Négatif = sous le seuil (favorable). Positif = au-dessus (défavorable).")
+
+    if rescaler.is_scalable("AMT_INCOME_TOTAL"):
+        revenu = rescaler.to_real("AMT_INCOME_TOTAL", client_row["AMT_INCOME_TOTAL"])
+        k5.metric("Revenu annuel", format_real("AMT_INCOME_TOTAL", revenu))
+    if rescaler.is_scalable("DAYS_BIRTH") and "DAYS_BIRTH" in df.columns:
+        age = rescaler.to_real("DAYS_BIRTH", client_row["DAYS_BIRTH"])
+        k6.metric("Âge", format_real("DAYS_BIRTH", age))
+
+    st.divider()
 
     # ══════════════════════════════════════════════════════════
     # ── SECTION 1 : Score & Décision ─────────────────────────
@@ -497,6 +639,10 @@ def main():
     # ── SECTION 3 : Profil du client ─────────────────────────
     # ══════════════════════════════════════════════════════════
     st.subheader("👤 Informations descriptives du client")
+    if scaler is not None:
+        st.caption(
+            "Valeurs ramenées en unités réelles (euros, années) via le scaler du preprocessing."
+        )
 
     # Affichage des principales variables dans un tableau lisible
     info_cols = [c for c in [
@@ -505,18 +651,24 @@ def main():
         "EXT_SOURCE_2", "EXT_SOURCE_3",
     ] if c in df.columns]
 
+    labels = {
+        "AMT_INCOME_TOTAL": "Revenu annuel",
+        "AMT_CREDIT":       "Montant du crédit",
+        "AMT_ANNUITY":      "Mensualité (annuité)",
+        "DAYS_BIRTH":       "Âge",
+        "DAYS_EMPLOYED":    "Ancienneté emploi",
+        "EXT_SOURCE_1":     "Score externe 1",
+        "EXT_SOURCE_2":     "Score externe 2",
+        "EXT_SOURCE_3":     "Score externe 3",
+    }
+
     if info_cols:
-        info_data = client_row[info_cols]
-        # Mise en forme spéciale pour DAYS_BIRTH → âge
         display = {}
         for col in info_cols:
-            val = info_data[col]
-            if col == "DAYS_BIRTH" and not pd.isna(val):
-                display["Âge (ans)"] = int(abs(val) / 365)
-            elif col == "DAYS_EMPLOYED" and not pd.isna(val):
-                display["Ancienneté emploi (ans)"] = round(abs(val) / 365, 1)
-            else:
-                display[col] = round(val, 4) if isinstance(val, float) else val
+            z = client_row[col]
+            # On repasse en réel si la variable est standardisée, sinon valeur brute
+            real = rescaler.to_real(col, z) if rescaler.is_scalable(col) else z
+            display[labels.get(col, col)] = format_real(col, real)
 
         info_df = pd.DataFrame(
             {"Variable": list(display.keys()),
@@ -584,47 +736,167 @@ def main():
     else:
         st.warning("Sélectionnez deux variables différentes.", icon="⚠️")
 
-    # ══════════════════════════════════════════════════════════
-    # ── SECTION 6 (optionnelle) : Simulation ─────────────────
-    # ══════════════════════════════════════════════════════════
     st.divider()
-    with st.expander("🧪 Simulation – Modifier les informations client (optionnel)"):
+
+    # ══════════════════════════════════════════════════════════
+    # ── SECTION 6 : Simulation « et si… ? » ──────────────────
+    # ══════════════════════════════════════════════════════════
+    st.subheader("🧪 Simulation « et si… ? »")
+
+    # Leviers réellement présents dans le modèle ET convertibles en euros
+    sim_features = [c for c in SIM_CANDIDATES
+                    if c in feature_cols and rescaler.is_scalable(c)]
+
+    if scaler is None or not sim_features:
+        st.info(
+            "La simulation en euros nécessite le scaler (`models/scaler.pkl`) et au moins "
+            "une variable financière parmi le revenu, le montant du crédit ou la mensualité.",
+            icon="ℹ️",
+        )
+    else:
         st.markdown(
-            "Modifiez une ou plusieurs valeurs pour simuler un nouveau score sans modifier les données réelles."
+            "Modifiez les informations financières du client pour recalculer le score, "
+            "sans toucher aux données réelles. Utile pour répondre à *« et si le revenu "
+            "augmentait ? »* ou *« et avec un montant de crédit plus faible ? »*."
         )
 
-        sim_features = [c for c in [
-            "AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY",
-            "EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3",
-        ] if c in feature_cols]
+        labels_sim = {
+            "AMT_INCOME_TOTAL": "Revenu annuel (€)",
+            "AMT_CREDIT":       "Montant du crédit (€)",
+            "AMT_ANNUITY":      "Mensualité / annuité (€)",
+        }
 
-        sim_vals = {}
-        cols_sim = st.columns(min(3, len(sim_features)))
-        for i, feat in enumerate(sim_features):
-            orig = float(client_row[feat]) if not pd.isna(client_row[feat]) else 0.0
-            sim_vals[feat] = cols_sim[i % 3].number_input(
-                feat, value=orig, format="%.4f", key=f"sim_{feat}",
-            )
+        # Un slider par levier, borné sur la distribution réelle (1er–99e centile)
+        sim_real = {}
+        cols_sliders = st.columns(len(sim_features))
+        for col_widget, feat in zip(cols_sliders, sim_features):
+            real_col = rescaler.real_series(df, feat)
+            lo = float(max(0.0, np.nanpercentile(real_col, 1)))
+            hi = float(np.nanpercentile(real_col, 99))
+            current = float(rescaler.to_real(feat, client_row[feat]))
+            current = min(max(current, lo), hi)  # borne au cas où le client est un outlier
+            step = max(1000.0, round((hi - lo) / 100, -2))
+            with col_widget:
+                sim_real[feat] = st.slider(
+                    labels_sim.get(feat, feat),
+                    min_value=round(lo, -2), max_value=round(hi, -2),
+                    value=round(current, -2), step=step,
+                    help=f"Valeur actuelle du client : {current:,.0f} €".replace(",", " "),
+                )
 
         if st.button("🔄 Recalculer le score simulé", type="primary"):
-            sim_dict = {**features_dict}
-            sim_dict.update({k: float(v) for k, v in sim_vals.items()})
+            overrides = {f: rescaler.to_scaled(f, v) for f, v in sim_real.items()}
             with st.spinner("Appel API en cours…"):
-                sim_result = call_api(sim_dict)
-            if sim_result:
-                sim_proba    = sim_result["probabilite_defaut"]
-                sim_decision = sim_result["decision"]
-                delta_proba  = sim_proba - proba
+                sim_res = call_api({**features_dict, **overrides})
+            if sim_res:
+                sim_proba    = sim_res["probabilite_defaut"]
+                sim_decision = sim_res["decision"]
+                delta_proba  = (sim_proba - proba) * 100
 
-                col_s1, col_s2 = st.columns(2)
-                col_s1.metric(
-                    "Probabilité simulée",
-                    f"{round(sim_proba*100,1)} %",
-                    delta=f"{delta_proba*100:+.1f} pts vs original",
-                    delta_color="inverse",
-                )
+                cs1, cs2, cs3 = st.columns(3)
+                cs1.metric("Probabilité simulée", f"{sim_proba*100:.1f} %",
+                           delta=f"{delta_proba:+.1f} pts vs actuel",
+                           delta_color="inverse")
                 icon_sim = "✅" if sim_decision == "ACCORDÉ" else "❌"
-                col_s2.metric("Décision simulée", f"{icon_sim} {sim_decision}")
+                cs2.metric("Décision simulée", f"{icon_sim} {sim_decision}")
+                cs3.metric("Décision initiale",
+                           f"{'✅' if decision == 'ACCORDÉ' else '❌'} {decision}")
+
+                # Message de bascule explicite
+                if sim_decision != decision:
+                    if sim_decision == "ACCORDÉ":
+                        st.success(
+                            "Avec ces paramètres, la décision **basculerait de REFUSÉ à ACCORDÉ**.",
+                            icon="✅",
+                        )
+                    else:
+                        st.error(
+                            "Avec ces paramètres, la décision **basculerait de ACCORDÉ à REFUSÉ**.",
+                            icon="❌",
+                        )
+                else:
+                    st.info("La décision reste inchangée avec ces paramètres.", icon="ℹ️")
+
+        # ── Recherche du seuil de bascule ─────────────────────
+        st.markdown("---")
+        st.markdown("**🎯 Seuil de bascule**")
+        st.markdown(
+            "Cherche automatiquement la valeur qui ferait changer la décision, "
+            "toutes choses égales par ailleurs."
+        )
+
+        # Options possibles selon les leviers disponibles et le sens métier
+        lever_options = {}
+        if "AMT_INCOME_TOTAL" in sim_features:
+            lever_options["Revenu à atteindre pour être ACCORDÉ"] = ("AMT_INCOME_TOTAL", True)
+        if "AMT_CREDIT" in sim_features:
+            lever_options["Montant de crédit maximal pour être ACCORDÉ"] = ("AMT_CREDIT", False)
+
+        if lever_options:
+            choix = st.selectbox("Levier à analyser", options=list(lever_options.keys()))
+            feat_t, decreasing = lever_options[choix]
+
+            if st.button("Calculer le seuil de bascule"):
+                if decision == "ACCORDÉ":
+                    st.info("Ce dossier est déjà accordé : pas de bascule à rechercher.", icon="ℹ️")
+                else:
+                    real_col = rescaler.real_series(df, feat_t)
+                    lo = float(max(0.0, np.nanpercentile(real_col, 1)))
+                    hi = float(np.nanpercentile(real_col, 99))
+                    current = float(rescaler.to_real(feat_t, client_row[feat_t]))
+
+                    # Fonction proba en fonction de la valeur réelle du levier
+                    def pf(x_real, _feat=feat_t):
+                        return proba_with_overrides(
+                            features_dict, {_feat: rescaler.to_scaled(_feat, x_real)}
+                        )
+
+                    with st.spinner("Recherche par dichotomie (quelques appels API)…"):
+                        if decreasing:
+                            # Revenu : borne haute = meilleur cas
+                            search_hi = max(hi, current * 3)
+                            if (pf(search_hi) or 1.0) >= seuil_v:
+                                st.warning(
+                                    "Même à un revenu très élevé, ce dossier ne passe pas : "
+                                    "d'autres facteurs (scores externes, historique) dominent la décision.",
+                                    icon="⚠️",
+                                )
+                                x_star = None
+                            else:
+                                x_star = bisect_tipping(pf, current, search_hi, seuil_v,
+                                                        proba_decreasing=True)
+                        else:
+                            # Crédit : borne basse = meilleur cas
+                            search_lo = min(lo, current * 0.2)
+                            if (pf(search_lo) or 1.0) >= seuil_v:
+                                st.warning(
+                                    "Même avec un crédit très faible, ce dossier ne passe pas : "
+                                    "d'autres facteurs dominent la décision.",
+                                    icon="⚠️",
+                                )
+                                x_star = None
+                            else:
+                                x_star = bisect_tipping(pf, search_lo, current, seuil_v,
+                                                        proba_decreasing=False)
+
+                    if x_star is not None:
+                        p_star = pf(x_star)
+                        if decreasing:
+                            delta = x_star - current
+                            st.success(
+                                f"Il faudrait un **revenu d'environ {x_star:,.0f} €** "
+                                f"(soit **+{delta:,.0f} €** par rapport aux {current:,.0f} € actuels) "
+                                f"pour que le dossier passe (proba ≈ {p_star*100:.1f} %).".replace(",", " "),
+                                icon="🎯",
+                            )
+                        else:
+                            delta = current - x_star
+                            st.success(
+                                f"Il faudrait un **crédit d'au plus {x_star:,.0f} €** "
+                                f"(soit **−{delta:,.0f} €** par rapport aux {current:,.0f} € demandés) "
+                                f"pour que le dossier passe (proba ≈ {p_star*100:.1f} %).".replace(",", " "),
+                                icon="🎯",
+                            )
 
     # ── Pied de page ─────────────────────────────────────────
     st.divider()
