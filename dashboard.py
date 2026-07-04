@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import os
 
-# ── Configuration de la page ────────────────────────────────
+# configuration de la page
 st.set_page_config(
     page_title="Prêt à Dépenser – Dashboard Scoring Crédit",
     page_icon="💳",
@@ -19,7 +19,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Constantes ───────────────────────────────────────────────
+# constantes
 API_URL = "https://rmercierwork-scoring-credit-p7.hf.space"
 
 # Adaptez ces chemins selon votre structure de fichiers
@@ -32,7 +32,7 @@ SCALER_PATH = "models/scaler.pkl"   # StandardScaler du preprocessing P7 (variab
 # Ce sont des leviers "actionnables" (contrairement à l'âge ou aux EXT_SOURCE).
 SIM_CANDIDATES = ["AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY"]
 
-# ── Accessibilité WCAG – palette accessible daltonisme ───────
+# accessibilité wcag – palette accessible daltonisme
 COLORS = {
     "accord":   "#2E7D32",  # vert foncé – contraste 7:1 sur blanc
     "refuse":   "#C62828",  # rouge foncé – contraste 7:1 sur blanc
@@ -46,7 +46,7 @@ COLORS = {
 OKABE_ITO = ["#E69F00", "#56B4E9", "#009E73", "#F0E442",
              "#0072B2", "#D55E00", "#CC79A7", "#000000"]
 
-# ── CSS personnalisé ─────────────────────────────────────────
+# css personnalisé
 st.markdown("""
 <style>
 /* Critère WCAG 1.4.4 – taille de texte redimensionnable */
@@ -79,7 +79,7 @@ button:focus, a:focus, select:focus { outline: 3px solid #1565C0 !important; }
 """, unsafe_allow_html=True)
 
 
-# ── Chargement des données (mis en cache) ────────────────────
+# chargement des données (mis en cache)
 @st.cache_data(show_spinner="Chargement des données clients…")
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -97,10 +97,7 @@ def load_model(model_path: str, seuil_path: str):
 
 @st.cache_resource(show_spinner="Chargement du scaler…")
 def load_scaler(scaler_path: str):
-    """Charge le StandardScaler du preprocessing.
-    Retourne None si absent : le dashboard reste fonctionnel mais affiche
-    les valeurs standardisées et désactive la simulation en euros.
-    """
+    # None si absent : on reste fonctionnel en valeurs standardisées
     if not os.path.exists(scaler_path):
         return None
     return joblib.load(scaler_path)
@@ -108,20 +105,14 @@ def load_scaler(scaler_path: str):
 
 @st.cache_resource(show_spinner="Calcul des SHAP (patience…)")
 def build_explainer(_model, X_sample: pd.DataFrame):
-    """Explainer SHAP TreeExplainer sur un échantillon."""
     explainer = shap.TreeExplainer(_model)
     return explainer
 
 
-# ── Conversion euros ↔ z-score via le scaler ─────────────────
+# conversion euros ↔ z-score via le scaler
 class Rescaler:
-    """Aller-retour entre valeurs réelles (€, jours…) et valeurs standardisées.
-
-    Le scaler a été entraîné sur un sous-ensemble de variables continues :
-    seules celles présentes dans `feature_names_in_` sont convertibles.
-    Les variables binaires (ex : CODE_GENDER_F) ne sont pas standardisées et
-    sont donc renvoyées telles quelles.
-    """
+    # conversion réel <-> z-score. seules les variables continues du scaler
+    # (feature_names_in_) sont convertibles ; les binaires restent telles quelles
     def __init__(self, scaler):
         self.scaler = scaler
         self.index = {}
@@ -132,30 +123,26 @@ class Rescaler:
         return feature in self.index
 
     def to_real(self, feature: str, z):
-        """z-score → valeur réelle."""
         if not self.is_scalable(feature):
             return z
         i = self.index[feature]
         return z * self.scaler.scale_[i] + self.scaler.mean_[i]
 
     def to_scaled(self, feature: str, real):
-        """valeur réelle → z-score."""
         if not self.is_scalable(feature):
             return real
         i = self.index[feature]
         return (real - self.scaler.mean_[i]) / self.scaler.scale_[i]
 
     def real_series(self, df: pd.DataFrame, feature: str) -> pd.Series:
-        """Colonne entière ramenée en valeurs réelles (pour bornes de sliders)."""
         if not self.is_scalable(feature):
             return df[feature]
         i = self.index[feature]
         return df[feature] * self.scaler.scale_[i] + self.scaler.mean_[i]
 
 
-# ── Appel API ────────────────────────────────────────────────
+# appel api
 def call_api(features: dict) -> dict | None:
-    """Appelle l'API /predict et retourne le JSON ou None si erreur."""
     try:
         resp = requests.post(
             f"{API_URL}/predict",
@@ -170,9 +157,7 @@ def call_api(features: dict) -> dict | None:
 
 
 def proba_with_overrides(base_features: dict, overrides_scaled: dict) -> float | None:
-    """Renvoie la probabilité de défaut en remplaçant certaines features
-    (valeurs déjà standardisées) puis en appelant l'API. Utilisé par la
-    simulation et la recherche du seuil de bascule."""
+    # proba après remplacement de certaines features (déjà standardisées)
     d = dict(base_features)
     d.update(overrides_scaled)
     res = call_api(d)
@@ -181,13 +166,8 @@ def proba_with_overrides(base_features: dict, overrides_scaled: dict) -> float |
 
 def bisect_tipping(pf, lo: float, hi: float, seuil: float,
                    proba_decreasing: bool, n_iter: int = 15):
-    """Recherche par dichotomie de la valeur (en €) qui fait basculer la décision.
-
-    pf(x) -> probabilité de défaut pour la valeur réelle x (ou None si erreur API).
-    proba_decreasing=True  : augmenter x diminue la proba (ex : revenu).
-    proba_decreasing=False : augmenter x augmente la proba (ex : montant du crédit).
-    Renvoie la valeur seuil x* (frontière ACCORDÉ / REFUSÉ).
-    """
+    # dichotomie sur la valeur (en €) qui fait basculer la décision.
+    # proba_decreasing=True : monter x baisse la proba (revenu) ; False : l'inverse (crédit)
     for _ in range(n_iter):
         mid = (lo + hi) / 2
         p = pf(mid)
@@ -209,13 +189,10 @@ def bisect_tipping(pf, lo: float, hi: float, seuil: float,
     return hi if proba_decreasing else lo
 
 
-# ── Graphique jauge ──────────────────────────────────────────
+# graphique jauge
 def make_gauge(proba: float, seuil: float, decision: str,
                title: str = "Probabilité de défaut") -> go.Figure:
-    """Jauge de probabilité de défaut.
-    WCAG 1.4.1 : la couleur n'est pas le seul indicateur (texte présent).
-    WCAG 1.4.3 : contraste suffisant sur fond blanc.
-    """
+    # couleur + texte (wcag 1.4.1), contraste suffisant sur blanc (wcag 1.4.3)
     color = COLORS["refuse"] if decision == "REFUSÉ" else COLORS["accord"]
     fig = go.Figure(go.Indicator(
         mode="gauge+number+delta",
@@ -266,14 +243,12 @@ def make_gauge(proba: float, seuil: float, decision: str,
     return fig
 
 
-# ── Graphique SHAP waterfall ─────────────────────────────────
+# graphique shap waterfall
 def make_shap_waterfall(shap_values: np.ndarray,
                         feature_names: list[str],
                         base_value: float,
                         top_n: int = 12) -> go.Figure:
-    """Top-N features par contribution SHAP (waterfall).
-    WCAG 1.4.1 : étiquettes textuelles sur chaque barre.
-    """
+    # top-n contributions shap ; étiquette chiffrée sur chaque barre (wcag 1.4.1)
     idx = np.argsort(np.abs(shap_values))[::-1][:top_n]
     vals  = shap_values[idx]
     names = [feature_names[i] for i in idx]
@@ -309,12 +284,10 @@ def make_shap_waterfall(shap_values: np.ndarray,
     return fig
 
 
-# ── Graphique distribution d'une feature ────────────────────
+# graphique distribution d'une feature
 def make_distrib(df: pd.DataFrame, feature: str,
                  client_val, decision: str) -> go.Figure:
-    """Distribution de la feature pour tous les clients + position du client.
-    WCAG 1.4.1 : marqueur client identifié par forme ET couleur.
-    """
+    # distribution population + position du client (marqueur forme+couleur, wcag 1.4.1)
     series = df[feature].dropna()
     is_numeric = pd.api.types.is_numeric_dtype(series)
 
@@ -376,13 +349,11 @@ def make_distrib(df: pd.DataFrame, feature: str,
     return fig
 
 
-# ── Graphique bi-varié ───────────────────────────────────────
+# graphique bi-varié
 def make_bivariate(df: pd.DataFrame,
                    feat_x: str, feat_y: str,
                    client_row: pd.Series) -> go.Figure:
-    """Scatter bi-varié entre deux features numériques.
-    WCAG 1.4.1 : formes différentes pour client vs population.
-    """
+    # scatter bi-varié ; formes différentes client vs population (wcag 1.4.1)
     sample = df[[feat_x, feat_y]].dropna().sample(
         min(1500, len(df)), random_state=42
     )
@@ -420,9 +391,9 @@ def make_bivariate(df: pd.DataFrame,
     return fig
 
 
-# ── Mise en forme d'une valeur réelle pour affichage ─────────
+# mise en forme d'une valeur réelle pour affichage
 def format_real(feature: str, real_val) -> str:
-    """Affiche une valeur réelle avec l'unité adaptée."""
+    # formate une valeur réelle avec son unité (€, années)
     if pd.isna(real_val):
         return "N/A"
     if feature == "DAYS_BIRTH":
@@ -435,18 +406,16 @@ def format_real(feature: str, real_val) -> str:
     return f"{real_val:.3f}"
 
 
-# ══════════════════════════════════════════════════════════════
-# ── Application principale ───────────────────────────────────
-# ══════════════════════════════════════════════════════════════
+# application principale
 def main():
-    # ── Titre principal (WCAG 2.4.2) ──────────────────────────
+    # titre principal (wcag 2.4.2)
     st.title("💳 Dashboard Scoring Crédit – Prêt à Dépenser")
     st.caption(
         "Outil d'aide à la décision à destination des chargés de relation client. "
         "Les décisions sont basées sur un modèle de Machine Learning (LightGBM)."
     )
 
-    # ── Chargement ────────────────────────────────────────────
+    # chargement
     if not os.path.exists(DATA_PATH):
         st.error(
             f"Fichier de données introuvable : `{DATA_PATH}`\n\n"
@@ -473,7 +442,7 @@ def main():
     num_features = [c for c in feature_cols
                     if pd.api.types.is_numeric_dtype(df[c])]
 
-    # ── Sidebar ───────────────────────────────────────────────
+    # sidebar
     with st.sidebar:
         st.header("🔍 Sélection du client")
 
@@ -512,7 +481,7 @@ def main():
             "La décision finale reste sous la responsabilité du chargé de relation client."
         )
 
-    # ── Appel API ────────────────────────────────────────────
+    # appel api
     features_dict = client_row[feature_cols].to_dict()
     # Convertir numpy types → python natifs pour JSON
     features_dict = {
@@ -531,9 +500,7 @@ def main():
     seuil_v  = result["seuil"]
     decision = result["decision"]
 
-    # ══════════════════════════════════════════════════════════
-    # ── CARTES DE SYNTHÈSE (en-tête) ─────────────────────────
-    # ══════════════════════════════════════════════════════════
+    # cartes de synthèse (en-tête)
     # Coup d'œil rapide : décision, proba, seuil, marge, et deux
     # repères client en unités réelles si le scaler est disponible.
     ecart_pts = (proba - seuil_v) * 100
@@ -553,9 +520,7 @@ def main():
 
     st.divider()
 
-    # ══════════════════════════════════════════════════════════
-    # ── SECTION 1 : Score & Décision ─────────────────────────
-    # ══════════════════════════════════════════════════════════
+    # section 1 : score & décision
     st.subheader("📊 Score et décision de crédit")
 
     col_gauge, col_decision = st.columns([1.6, 1], gap="large")
@@ -602,9 +567,7 @@ def main():
 
     st.divider()
 
-    # ══════════════════════════════════════════════════════════
-    # ── SECTION 2 : Explication SHAP ─────────────────────────
-    # ══════════════════════════════════════════════════════════
+    # section 2 : explication shap
     st.subheader("🔬 Explication de la décision (SHAP)")
     st.markdown(
         "Les barres rouges représentent les variables qui **augmentent** la probabilité de défaut "
@@ -635,9 +598,7 @@ def main():
 
     st.divider()
 
-    # ══════════════════════════════════════════════════════════
-    # ── SECTION 3 : Profil du client ─────────────────────────
-    # ══════════════════════════════════════════════════════════
+    # section 3 : profil du client
     st.subheader("👤 Informations descriptives du client")
     if scaler is not None:
         st.caption(
@@ -688,9 +649,7 @@ def main():
 
     st.divider()
 
-    # ══════════════════════════════════════════════════════════
-    # ── SECTION 4 : Comparaison client / population ──────────
-    # ══════════════════════════════════════════════════════════
+    # section 4 : comparaison client / population
     st.subheader("📈 Comparaison client / population")
     st.markdown("Sélectionnez une variable pour voir où se situe le client par rapport à l'ensemble des clients.")
 
@@ -716,9 +675,7 @@ def main():
 
     st.divider()
 
-    # ══════════════════════════════════════════════════════════
-    # ── SECTION 5 : Analyse bi-variée ────────────────────────
-    # ══════════════════════════════════════════════════════════
+    # section 5 : analyse bi-variée
     st.subheader("🔀 Analyse bi-variée")
     st.markdown("Comparez deux variables numériques et visualisez la position du client dans la population.")
 
@@ -738,9 +695,7 @@ def main():
 
     st.divider()
 
-    # ══════════════════════════════════════════════════════════
-    # ── SECTION 6 : Simulation « et si… ? » ──────────────────
-    # ══════════════════════════════════════════════════════════
+    # section 6 : simulation « et si… ? »
     st.subheader("🧪 Simulation « et si… ? »")
 
     # Leviers réellement présents dans le modèle ET convertibles en euros
@@ -817,7 +772,7 @@ def main():
                 else:
                     st.info("La décision reste inchangée avec ces paramètres.", icon="ℹ️")
 
-        # ── Recherche du seuil de bascule ─────────────────────
+        # recherche du seuil de bascule
         st.markdown("---")
         st.markdown("**🎯 Seuil de bascule**")
         st.markdown(
@@ -898,7 +853,7 @@ def main():
                                 icon="🎯",
                             )
 
-    # ── Pied de page ─────────────────────────────────────────
+    # pied de page
     st.divider()
     st.caption(
         "Dashboard P8 – Prêt à Dépenser | "
